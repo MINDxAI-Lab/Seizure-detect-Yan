@@ -1,7 +1,5 @@
 # Seizure-detect-Yan
 
-![alt text](<Screenshot 2025-08-19 090905.png>)
-
 --/Pattn/main_cls.py: 
     Main function for training Pattn. Including args settings, training, & result visualization.
 
