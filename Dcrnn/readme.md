@@ -16,5 +16,5 @@ For most of the parameters you don't need to change them, you only to change the
 
 "/Dcrnn/model" All model structures are in this folder (usually no need to the codes in this folder)
 
-**Data augmentation related code**
+**Data augmentation related code**  
 Please refer to "/Pattn/data_provider/data_loader.py" for the data augmentation methods, there are specific comments and remarks for you to understand.
