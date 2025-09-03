@@ -8,13 +8,15 @@ import torch
 import torch.nn as nn
 from torch import optim
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
 import os
 import time
 from datetime import datetime
+
 import warnings
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use("Agg") 
+matplotlib.use("Agg")  # 使用非交互式后端
 import numpy as np
 from datetime import datetime
 
@@ -24,13 +26,11 @@ import random
 warnings.filterwarnings('ignore')
 
 fix_seed = 2021
-# Set random seeds for reproducibility
 random.seed(fix_seed)
 torch.manual_seed(fix_seed)
 np.random.seed(fix_seed)
 
 parser = argparse.ArgumentParser(description='PAttn Binary Classification')
-# Argument parser for all model, data, and augmentation parameters
 
 parser.add_argument('--model_id', type=str, required=True, default='test')
 parser.add_argument('--checkpoints', type=str, default='./checkpoints/')
@@ -74,19 +74,17 @@ parser.add_argument('--save_file_name', type=str, default='cls_results.txt')
 parser.add_argument('--gpu_loc', type=int, default=0)
 parser.add_argument('--method', type=str, default='PAttn')
 
-## ---- Data Augmentation Parameters ----
-parser.add_argument('--aug_method', type=str, default='none', choices=['none', 'decomp', 'ww', 'both'], 
-                   help='Data augmentation method: none, decomp (decomposition), ww (window warping), both')
-
-# Decomposition augmentation parameters
-parser.add_argument('--aug_p', type=float, default=0.5, help='Probability of applying decomposition augmentation')
+# ---- Decomposition-based data augmentation parameters ----
+parser.add_argument('--aug_decomp', action='store_true', help='Enable decomposition-based augmentation')
+parser.add_argument('--aug_p', type=float, default=0.5, help='Probability of applying augmentation')
 parser.add_argument('--aug_win', type=int, default=129, help='Window size for moving average trend decomposition (~0.5s @256Hz)')
 parser.add_argument('--aug_scale_low', type=float, default=0.9, help='Lower bound for residual scaling')
 parser.add_argument('--aug_scale_high', type=float, default=1.1, help='Upper bound for residual scaling')
 parser.add_argument('--aug_noise', type=float, default=0.02, help='Noise ratio relative to residual standard deviation')
-parser.add_argument('--aug_only_bg', action='store_true', help='Apply decomposition augmentation only to background (non-seizure) samples')
+parser.add_argument('--aug_only_bg', action='store_true', help='Apply augmentation only to background (non-seizure) samples')
 
-# Window Warping augmentation parameters
+# ---- Window warping data augmentation parameters ----
+parser.add_argument('--aug_ww', action='store_true', help='Enable Window Warping augmentation')
 parser.add_argument('--aug_ww_p_low', type=float, default=0.3, help='Lower bound for WW trigger probability')
 parser.add_argument('--aug_ww_p_high', type=float, default=0.7, help='Upper bound for WW trigger probability')
 parser.add_argument('--aug_ww_win_ratio_low', type=float, default=0.1, help='Lower bound for sub-window ratio')
@@ -96,31 +94,31 @@ parser.add_argument('--aug_ww_speed_high', type=float, default=1.2, help='Upper 
 parser.add_argument('--aug_ww_margin', type=float, default=0.5, help='Margin from boundaries in seconds')
 parser.add_argument('--aug_ww_only_bg', action='store_true', help='Apply WW augmentation only to background (non-seizure) samples')
 
+# ---- Frequency domain data augmentation parameters ----
+parser.add_argument('--aug_freq', action='store_true', help='Enable Frequency Domain augmentation')
+parser.add_argument('--aug_freq_p', type=float, default=0.5, help='Probability of applying frequency domain augmentation')
+parser.add_argument('--aug_freq_num_segments', type=int, default=3, help='Number of continuous frequency segments to perturb')
+parser.add_argument('--aug_freq_segment_ratio_low', type=float, default=0.05, help='Lower bound for segment length ratio')
+parser.add_argument('--aug_freq_segment_ratio_high', type=float, default=0.15, help='Upper bound for segment length ratio')
+parser.add_argument('--aug_freq_magnitude_preserve', action='store_true', help='Whether to preserve energy by matching original magnitude statistics')
+parser.add_argument('--aug_freq_phase_noise_std', type=float, default=0.1, help='Standard deviation for phase noise (in radians)')
+parser.add_argument('--aug_freq_only_bg', action='store_true', help='Apply frequency augmentation only to background (non-seizure) samples')
+
 # Loss function parameters
 parser.add_argument('--pos_weight', type=float, default=None, help='Positive class weight for BCEWithLogitsLoss (for handling class imbalance)')
 parser.add_argument('--auto_pos_weight', action='store_true', help='Automatically calculate pos_weight based on class distribution in training data')
 
 args = parser.parse_args()
 
-## Set augmentation flags based on aug_method
-args.aug_decomp = args.aug_method in ['decomp', 'both']
-args.aug_ww = args.aug_method in ['ww', 'both']
-
 device_address = 'cuda:'+str(args.gpu_loc)
 
 def select_optimizer(model, args):
-    """
-    Select and return the optimizer for model training.
-    Currently uses Adam optimizer with the specified learning rate.
-    """
+    """Simplified optimizer selection for classification"""
     model_optim = optim.Adam(model.parameters(), lr=args.learning_rate)
     return model_optim
 
 def calculate_pos_weight(train_loader, device):
-    """
-    Calculate the positive class weight for BCEWithLogitsLoss based on the class distribution in the training data.
-    Returns pos_weight value (float).
-    """
+    """Calculate pos_weight based on class distribution in training data"""
     total_positive = 0
     total_negative = 0
     
@@ -140,10 +138,7 @@ def calculate_pos_weight(train_loader, device):
     return pos_weight
 
 def plot_training_curves(save_dir, training_history, fig_dir="figs"):
-    """
-    Plot and save training curves (loss, accuracy, F1, learning rate) for each epoch.
-    Saves figures to a timestamped subdirectory. (Will replace this part with Tensor Board, need more time)
-    """
+    """绘制训练过程的损失曲线和指标曲线，保持与train_dcrnn.py相同的风格"""
     try:
         # 创建带时间戳的子目录
         now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -271,9 +266,7 @@ def plot_training_curves(save_dir, training_history, fig_dir="figs"):
         return None
 
 def get_predictions(model, data_loader, device):
-    """
-    Run inference on a data loader and return predicted labels and true labels for F1 score calculation.
-    """
+    """Get predictions and true labels for F1 score calculation"""
     all_preds = []
     all_labels = []
     
@@ -295,10 +288,7 @@ def get_predictions(model, data_loader, device):
     return all_preds, all_labels
 
 def vali_cls(model, vali_data, vali_loader, criterion, args, device):
-    """
-    Validation loop for binary classification.
-    Returns average loss and accuracy for the validation set.
-    """
+    """Validation function for binary classification"""
     total_loss = []
     all_preds = []
     all_labels = []
@@ -336,10 +326,7 @@ def vali_cls(model, vali_data, vali_loader, criterion, args, device):
     return total_loss, accuracy
 
 def test_cls(model, test_data, test_loader, args, device):
-    """
-    Test loop for binary classification.
-    Returns accuracy, precision, recall, F1, and AUC for the test set.
-    """
+    """Test function for binary classification"""
     all_preds = []
     all_labels = []
     all_probs = []
@@ -383,10 +370,7 @@ def test_cls(model, test_data, test_loader, args, device):
     
     return accuracy, precision, recall, f1, auc
 
-###########################################################
-# Main training loop: runs for args.itr iterations
-# Each iteration trains a new model, validates, tests, and saves results
-###########################################################
+# Main training loop
 accuracies = []
 precisions = []
 recalls = []
@@ -396,33 +380,25 @@ aucs = []
 print(f"Starting EEG Seizure Detection Training")
 print(f"Model: {args.model_id}")
 print(f"Total iterations: {args.itr}")
-print(f"Data Augmentation: {args.aug_method}")
-if args.aug_decomp:
-    print(f"  - Decomposition: enabled (p={args.aug_p}, win={args.aug_win}, only_bg={args.aug_only_bg})")
-if args.aug_ww:
-    print(f"  - Window Warping: enabled (p=[{args.aug_ww_p_low},{args.aug_ww_p_high}], ratio=[{args.aug_ww_win_ratio_low},{args.aug_ww_win_ratio_high}], only_bg={args.aug_ww_only_bg})")
-if args.aug_method == 'none':
-    print(f"  - No augmentation")
 print("=" * 60)
 
 for ii in range(args.itr):
     print(f"\nIteration {ii+1}/{args.itr}")
-    # Format string for experiment setting (for logging/checkpoints)
     setting = '{}_sl{}_dm{}_nh{}_el{}_df{}_itr{}'.format(
         args.model_id, args.seq_len, args.d_model, args.n_heads, 
         args.e_layers, args.d_ff, ii)
     
-    # Create unique checkpoint path with timestamp to avoid conflicts
+    # Create unique path with timestamp to avoid conflicts
     import time
     timestamp = int(time.time())
     path = './checkpoints/' + args.model_id + '_' + str(ii) + '_' + str(timestamp)
     if not os.path.exists(path):
         os.makedirs(path)
 
-    # Always train fresh (no skip mechanism)
+    # Remove skip mechanism - always train fresh
     # Each run will have unique timestamp
-    
-    # Load training data and fit scaler
+        
+    # First create training data to fit the scaler
     train_data, train_loader = data_provider(args, 'train')
     
     # Pass the training scaler to validation and test datasets
@@ -433,17 +409,15 @@ for ii in range(args.itr):
     time_now = time.time()
     train_steps = len(train_loader)
 
-    # Initialize model
     if args.model == 'PAttn':
         model = PAttn(args, device)
         print(f"Model loaded on device: {device}")
         model.to(device)
 
-    # Set up optimizer and early stopping
     model_optim = select_optimizer(model, args)
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
     
-    # Set up binary classification loss with optional pos_weight
+    # Binary classification loss with optional pos_weight
     pos_weight_value = None
     if args.auto_pos_weight:
         pos_weight_value = calculate_pos_weight(train_loader, device)
@@ -459,8 +433,7 @@ for ii in range(args.itr):
     else:
         criterion = nn.BCEWithLogitsLoss()
         print("Using BCEWithLogitsLoss without pos_weight")
-    
-    # Learning rate scheduler
+        
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=args.tmax, eta_min=1e-8)
     
     # Initialize training history for this iteration
@@ -482,10 +455,10 @@ for ii in range(args.itr):
         model.train()
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in train_bar:
             if is_first:
-                # Print input and label shapes for the first batch
+                # [batch size, channels, seq_len] & [batch size] for classification
                 print(f"Data shapes - Input: {batch_x.shape}, Labels: {batch_y.shape}")
                 is_first = False
-            
+                
             iter_count += 1
             model_optim.zero_grad()
 
@@ -509,7 +482,7 @@ for ii in range(args.itr):
                 'Loss': f'{current_loss:.4f}',
                 'LR': f'{model_optim.param_groups[0]["lr"]:.2e}'
             })
-            
+                
             loss.backward()
             model_optim.step()
 
@@ -522,16 +495,16 @@ for ii in range(args.itr):
         train_acc = accuracy_score(train_labels, train_preds)
         train_f1 = f1_score(train_labels, train_preds)
         
-        # Validation loss and accuracy
         vali_loss, vali_acc = vali_cls(model, vali_data, vali_loader, criterion, args, device)
         
-        # Validation F1 score
+        # Calculate validation F1 score
+        # Need to modify vali_cls to return predictions for F1 calculation
         vali_preds, vali_labels_true = get_predictions(model, vali_loader, device)
         vali_f1 = f1_score(vali_labels_true, vali_preds)
 
         print(f"Epoch {epoch + 1}/{args.train_epochs} | Train Loss: {train_loss:.6f} | Vali Loss: {vali_loss:.6f} | Train Acc: {train_acc:.4f} | Vali Acc: {vali_acc:.4f} | Train F1: {train_f1:.4f} | Vali F1: {vali_f1:.4f}")
 
-        # Record training history for plotting
+        # Record training history
         current_lr = model_optim.param_groups[0]['lr']
         epoch_record = {
             'epoch': epoch + 1,
@@ -545,34 +518,30 @@ for ii in range(args.itr):
         }
         training_history.append(epoch_record)
 
-        # Update learning rate
         if args.cos:
             scheduler.step()
             print(f"Learning Rate: {model_optim.param_groups[0]['lr']:.2e}")
         else:
             adjust_learning_rate(model_optim, epoch + 1, args)
-        
-        # Early stopping based on validation loss
+            
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:
             print("Early stopping")
             break
-    
+                    
     # Load best model and test
     best_model_path = path + '/' + 'checkpoint.pth'
     model.load_state_dict(torch.load(best_model_path))
     print("------------------------------------")
     
-    # Test and evaluate metrics
     accuracy, precision, recall, f1, auc = test_cls(model, test_data, test_loader, args, device)
     
-    # Generate and save training curves for this iteration
+    # Generate visualization for this iteration
     print(f"\nGenerating training curves for iteration {ii+1}...")
     fig_dir = plot_training_curves(path, training_history, fig_dir="figs")
     if fig_dir:
         print(f"Visualization saved for iteration {ii+1}")
     
-    # Store metrics for summary
     accuracies.append(round(accuracy, 4))
     precisions.append(round(precision, 4))
     recalls.append(round(recall, 4))
@@ -581,7 +550,7 @@ for ii in range(args.itr):
     
     print(f"Iteration {ii+1} completed successfully")
 
-# Final results summary and saving
+# Final results
 if len(accuracies) == 0:
     print("No results to display")
     exit()

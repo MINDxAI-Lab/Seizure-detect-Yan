@@ -74,7 +74,17 @@ def data_provider(args, flag, drop_last_test=True, train_all=False, train_scaler
             aug_ww_speed_low=getattr(args, 'aug_ww_speed_low', 0.8),
             aug_ww_speed_high=getattr(args, 'aug_ww_speed_high', 1.2),
             aug_ww_margin=getattr(args, 'aug_ww_margin', 0.5),
-            aug_ww_only_bg=getattr(args, 'aug_ww_only_bg', False)
+            aug_ww_only_bg=getattr(args, 'aug_ww_only_bg', False),
+            
+            # Pass Frequency Domain augmentation parameters
+            aug_freq=getattr(args, 'aug_freq', False),
+            aug_freq_p=getattr(args, 'aug_freq_p', 0.5),
+            aug_freq_num_segments=getattr(args, 'aug_freq_num_segments', 3),
+            aug_freq_segment_ratio_low=getattr(args, 'aug_freq_segment_ratio_low', 0.05),
+            aug_freq_segment_ratio_high=getattr(args, 'aug_freq_segment_ratio_high', 0.15),
+            aug_freq_magnitude_preserve=getattr(args, 'aug_freq_magnitude_preserve', False),
+            aug_freq_phase_noise_std=getattr(args, 'aug_freq_phase_noise_std', 0.1),
+            aug_freq_only_bg=getattr(args, 'aug_freq_only_bg', False)
         )
     else:
         # For other standard time-series forecasting datasets

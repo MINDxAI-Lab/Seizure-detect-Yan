@@ -218,6 +218,361 @@ def _window_warping_step3(x: torch.Tensor, start_idx: int, end_idx: int, speed_r
     result[:, start_idx:end_idx] = final_resampled  # Replace sub-window with warped version
     
     return result
+
+# --- Frequency Domain Augmentation ---
+
+def _fft_augment_step1_step2(x: torch.Tensor, 
+                            num_segments: int = 3, 
+                            segment_length_ratio_range: tuple = (0.05, 0.15),
+                            seed: int = None):
+    """
+    Step 1: FFT - Compute Discrete Fourier Transform to get magnitude and phase spectra
+    Step 2: Select frequency segments - Randomly sample continuous frequency segments
+    
+    Args:
+        x: Input signal of shape (C, L) where C=channels, L=sequence length
+        num_segments: Number of continuous frequency segments to select
+        segment_length_ratio_range: Range for segment length ratio (relative to total frequency bins)
+        seed: Random seed for reproducibility (optional)
+        
+    Returns:
+        tuple: (magnitude_spectrum, phase_spectrum, freq_segments_mask)
+            - magnitude_spectrum: (C, L//2+1) - one-sided magnitude spectrum
+            - phase_spectrum: (C, L//2+1) - one-sided phase spectrum  
+            - freq_segments_mask: (L//2+1,) - binary mask indicating selected frequency segments
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+    
+    C, L = x.shape
+    
+    # Step 1: FFT - Compute Discrete Fourier Transform
+    # Use rfft for real-valued signals to get one-sided spectrum
+    x_fft = torch.fft.rfft(x, dim=1)  # (C, L//2+1) complex spectrum
+    
+    # Extract magnitude and phase spectra
+    magnitude_spectrum = torch.abs(x_fft)  # (C, L//2+1) - magnitude spectrum
+    phase_spectrum = torch.angle(x_fft)    # (C, L//2+1) - phase spectrum
+    
+    # Step 2: Select frequency segments
+    freq_bins = magnitude_spectrum.shape[1]  # L//2+1
+    
+    # Initialize mask for selected frequency segments
+    freq_segments_mask = torch.zeros(freq_bins, dtype=torch.bool, device=x.device)
+    
+    # Randomly sample segment parameters
+    min_segment_len = max(1, int(freq_bins * segment_length_ratio_range[0]))
+    max_segment_len = max(min_segment_len, int(freq_bins * segment_length_ratio_range[1]))
+    
+    segments_placed = 0
+    attempts = 0
+    max_attempts = num_segments * 10  # Prevent infinite loops
+    
+    while segments_placed < num_segments and attempts < max_attempts:
+        attempts += 1
+        
+        # Randomly select segment length
+        segment_len = torch.randint(min_segment_len, max_segment_len + 1, (1,)).item()
+        
+        # Randomly select segment start position
+        max_start = freq_bins - segment_len
+        if max_start < 0:
+            continue
+            
+        segment_start = torch.randint(0, max_start + 1, (1,)).item()
+        segment_end = segment_start + segment_len
+        
+        # Check for overlap with existing segments
+        if not freq_segments_mask[segment_start:segment_end].any():
+            # No overlap, place the segment
+            freq_segments_mask[segment_start:segment_end] = True
+            segments_placed += 1
+    
+    return magnitude_spectrum, phase_spectrum, freq_segments_mask
+
+def _apply_frequency_perturbation_step3_step4(magnitude_spectrum: torch.Tensor, 
+                                              phase_spectrum: torch.Tensor,
+                                              freq_segments_mask: torch.Tensor,
+                                              magnitude_preserve_energy: bool = True,
+                                              phase_noise_std: float = 0.1):
+    """
+    Step 3 & 4: Apply sophisticated perturbations to magnitude and phase spectra.
+    
+    Step 3 - Magnitude perturbation: Replace magnitude values in selected segments with 
+             Gaussian noise that preserves the original mean and variance of each segment.
+    Step 4 - Phase perturbation: Add zero-mean Gaussian noise to phase values in selected 
+             segments with controlled variance to preserve main morphology.
+    
+    Args:
+        magnitude_spectrum: (C, freq_bins) - magnitude spectrum
+        phase_spectrum: (C, freq_bins) - phase spectrum  
+        freq_segments_mask: (freq_bins,) - binary mask for selected frequency segments
+        magnitude_preserve_energy: Whether to preserve energy by matching original statistics
+        phase_noise_std: Standard deviation for phase noise (in radians)
+        
+    Returns:
+        tuple: (perturbed_magnitude, perturbed_phase)
+    """
+    C, freq_bins = magnitude_spectrum.shape
+    
+    # Create copies to avoid modifying original spectra
+    perturbed_magnitude = magnitude_spectrum.clone()
+    perturbed_phase = phase_spectrum.clone()
+    
+    # Only apply perturbations to selected frequency segments
+    if freq_segments_mask.any():
+        # Use broadcasting to apply mask across all channels
+        mask_expanded = freq_segments_mask.unsqueeze(0).expand(C, -1)  # (C, freq_bins)
+        
+        # Step 3: Magnitude perturbation with energy preservation
+        if magnitude_preserve_energy:
+            # For each channel, calculate statistics of selected frequency segments
+            for ch in range(C):
+                selected_magnitudes = magnitude_spectrum[ch][freq_segments_mask]
+                
+                if len(selected_magnitudes) > 0:
+                    # Calculate mean and std of original magnitude values in selected segments
+                    original_mean = selected_magnitudes.mean()
+                    original_std = selected_magnitudes.std()
+                    
+                    # Generate Gaussian noise with same statistics
+                    num_selected = len(selected_magnitudes)
+                    magnitude_noise = torch.normal(
+                        mean=original_mean, 
+                        std=original_std, 
+                        size=(num_selected,),
+                        device=magnitude_spectrum.device
+                    )
+                    
+                    # Ensure positive values (magnitude must be non-negative)
+                    magnitude_noise = torch.abs(magnitude_noise)
+                    
+                    # Replace magnitude values in selected segments
+                    perturbed_magnitude[ch][freq_segments_mask] = magnitude_noise
+        else:
+            # Simple multiplicative perturbation (fallback method)
+            magnitude_noise = torch.randn_like(magnitude_spectrum) * 0.1
+            magnitude_multiplier = 1 + magnitude_noise
+            perturbed_magnitude = torch.where(mask_expanded, 
+                                            magnitude_spectrum * magnitude_multiplier,
+                                            magnitude_spectrum)
+            perturbed_magnitude = torch.abs(perturbed_magnitude)
+        
+        # Step 4: Phase perturbation with zero-mean Gaussian noise
+        # Generate zero-mean Gaussian noise for phase perturbation
+        phase_noise = torch.normal(
+            mean=0.0, 
+            std=phase_noise_std, 
+            size=phase_spectrum.shape,
+            device=phase_spectrum.device
+        )
+        
+        # Apply phase perturbation only to selected frequency segments
+        perturbed_phase = torch.where(mask_expanded,
+                                    phase_spectrum + phase_noise,
+                                    phase_spectrum)
+        
+        # Wrap phase to [-π, π] range to maintain proper phase representation
+        perturbed_phase = torch.remainder(perturbed_phase + np.pi, 2 * np.pi) - np.pi
+    
+    return perturbed_magnitude, perturbed_phase
+
+# Backward compatibility function - delegates to the new implementation
+def _apply_frequency_perturbation(magnitude_spectrum: torch.Tensor, 
+                                 phase_spectrum: torch.Tensor,
+                                 freq_segments_mask: torch.Tensor,
+                                 magnitude_noise_scale: float = 0.1,
+                                 phase_noise_scale: float = 0.1):
+    """
+    Legacy function for backward compatibility. 
+    Delegates to the new step3/step4 implementation.
+    """
+    return _apply_frequency_perturbation_step3_step4(
+        magnitude_spectrum, 
+        phase_spectrum, 
+        freq_segments_mask,
+        magnitude_preserve_energy=True,
+        phase_noise_std=phase_noise_scale
+    )
+
+def _ensure_conjugate_symmetry_step5(magnitude_spectrum: torch.Tensor, 
+                                    phase_spectrum: torch.Tensor,
+                                    original_length: int):
+    """
+    Step 5: Ensure conjugate symmetry for real signals to guarantee real-valued IFFT output.
+    
+    For real-valued input signals, the frequency spectrum must satisfy conjugate symmetry:
+    X[k] = X*[N-k] for k = 1, 2, ..., N/2-1
+    
+    This means:
+    - DC component (k=0) must be real (phase=0)
+    - Nyquist component (k=N/2, if N is even) must be real (phase=0 or π)
+    - Magnitude spectrum is symmetric: |X[k]| = |X[N-k]|
+    - Phase spectrum is antisymmetric: ∠X[k] = -∠X[N-k]
+    
+    Args:
+        magnitude_spectrum: (C, freq_bins) - magnitude spectrum from rfft (one-sided)
+        phase_spectrum: (C, freq_bins) - phase spectrum from rfft (one-sided)
+        original_length: Original time-domain sequence length
+        
+    Returns:
+        tuple: (corrected_magnitude, corrected_phase) with conjugate symmetry enforced
+    """
+    C, freq_bins = magnitude_spectrum.shape
+    
+    # Create copies to avoid modifying original arrays
+    corrected_magnitude = magnitude_spectrum.clone()
+    corrected_phase = phase_spectrum.clone()
+    
+    # Step 5.1: Ensure DC component (k=0) has zero phase
+    corrected_phase[:, 0] = 0.0
+    
+    # Step 5.2: Handle Nyquist frequency if original length is even
+    if original_length % 2 == 0:
+        # For even-length signals, the Nyquist component (last element) must be real
+        # Force phase to be 0 or π (choose 0 for simplicity)
+        corrected_phase[:, -1] = 0.0
+    
+    # Step 5.3: Note about conjugate symmetry
+    # Since we're using rfft (real FFT), PyTorch automatically handles the conjugate 
+    # symmetry constraint during irfft. The one-sided spectrum from rfft inherently 
+    # represents a conjugate-symmetric two-sided spectrum.
+    # 
+    # The rfft output represents frequencies [0, 1, 2, ..., N/2] where:
+    # - Element 0: DC component (must be real)
+    # - Elements 1 to N/2-1: Positive frequencies  
+    # - Element N/2 (if N even): Nyquist frequency (must be real)
+    #
+    # During irfft, PyTorch reconstructs the negative frequencies using conjugate symmetry:
+    # X[-k] = X*[k] for k = 1, 2, ..., N/2-1
+    
+    return corrected_magnitude, corrected_phase
+
+def _ifft_reconstruct_step6(magnitude_spectrum: torch.Tensor, 
+                           phase_spectrum: torch.Tensor,
+                           original_length: int):
+    """
+    Step 6: Reconstruct time-domain signal using inverse FFT with conjugate symmetry.
+    
+    This function performs the final inverse FFT transformation to convert the 
+    modified frequency domain representation back to a real-valued time-domain signal.
+    
+    Args:
+        magnitude_spectrum: (C, freq_bins) - magnitude spectrum
+        phase_spectrum: (C, freq_bins) - phase spectrum
+        original_length: Original time-domain sequence length
+        
+    Returns:
+        torch.Tensor: Reconstructed real-valued time-domain signal of shape (C, original_length)
+    """
+    # Step 5: Ensure conjugate symmetry for real signals
+    corrected_magnitude, corrected_phase = _ensure_conjugate_symmetry_step5(
+        magnitude_spectrum, phase_spectrum, original_length
+    )
+    
+    # Step 6.1: Reconstruct complex spectrum from corrected magnitude and phase
+    complex_spectrum = corrected_magnitude * torch.exp(1j * corrected_phase)
+    
+    # Step 6.2: Apply inverse real FFT to get time-domain signal
+    # irfft automatically assumes conjugate symmetry and produces real output
+    reconstructed_signal = torch.fft.irfft(complex_spectrum, n=original_length, dim=1)
+    
+    # Step 6.3: Ensure output is strictly real-valued 
+    # (remove any tiny imaginary components due to numerical precision)
+    reconstructed_signal = reconstructed_signal.real
+    
+    # Step 6.4: Verify the reconstruction is real-valued
+    if torch.is_complex(reconstructed_signal):
+        # This should not happen with proper conjugate symmetry
+        reconstructed_signal = reconstructed_signal.real
+        
+    return reconstructed_signal
+
+# Backward compatibility function
+def _ifft_reconstruct(magnitude_spectrum: torch.Tensor, 
+                     phase_spectrum: torch.Tensor,
+                     original_length: int):
+    """
+    Legacy IFFT reconstruction function for backward compatibility.
+    Delegates to the new step6 implementation with conjugate symmetry.
+    """
+    return _ifft_reconstruct_step6(magnitude_spectrum, phase_spectrum, original_length)
+    
+    return reconstructed_signal
+
+def _frequency_domain_augment(x: torch.Tensor,
+                            num_segments: int = 3,
+                            segment_length_ratio_range: tuple = (0.05, 0.15), 
+                            magnitude_preserve_energy: bool = True,
+                            phase_noise_std: float = 0.1,
+                            seed: int = None):
+    """
+    Complete frequency domain augmentation pipeline:
+    1. FFT: Convert to frequency domain
+    2. Select frequency segments: Randomly sample continuous frequency segments  
+    3. Magnitude perturbation: Replace with Gaussian noise preserving original statistics
+    4. Phase perturbation: Add zero-mean Gaussian noise with controlled variance
+    5. Conjugate symmetry: Ensure proper conjugate symmetry for real signals
+    6. IFFT: Convert back to time domain with real-valued output
+    
+    Args:
+        x: Input signal of shape (C, L) where C=channels, L=sequence length
+        num_segments: Number of continuous frequency segments to perturb
+        segment_length_ratio_range: Range for segment length ratio
+        magnitude_preserve_energy: Whether to preserve energy by matching original magnitude statistics
+        phase_noise_std: Standard deviation for phase noise (in radians)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        torch.Tensor: Augmented signal with same shape (C, L)
+    """
+    C, L = x.shape
+    
+    # Step 1 & 2: FFT and frequency segment selection
+    magnitude_spectrum, phase_spectrum, freq_segments_mask = _fft_augment_step1_step2(
+        x, num_segments, segment_length_ratio_range, seed
+    )
+    
+    # Step 3 & 4: Apply sophisticated perturbations to selected frequency segments
+    perturbed_magnitude, perturbed_phase = _apply_frequency_perturbation_step3_step4(
+        magnitude_spectrum, phase_spectrum, freq_segments_mask,
+        magnitude_preserve_energy, phase_noise_std
+    )
+    
+    # Step 5 & 6: Ensure conjugate symmetry and perform IFFT reconstruction
+    augmented_signal = _ifft_reconstruct_step6(perturbed_magnitude, perturbed_phase, L)
+    
+    return augmented_signal
+
+# Legacy function for backward compatibility
+def _frequency_domain_augment_legacy(x: torch.Tensor,
+                                   num_segments: int = 3,
+                                   segment_length_ratio_range: tuple = (0.05, 0.15), 
+                                   magnitude_noise_scale: float = 0.1,
+                                   phase_noise_scale: float = 0.1,
+                                   seed: int = None):
+    """
+    Legacy frequency domain augmentation with simple perturbations.
+    Kept for backward compatibility.
+    """
+    C, L = x.shape
+    
+    # Step 1 & 2: FFT and frequency segment selection
+    magnitude_spectrum, phase_spectrum, freq_segments_mask = _fft_augment_step1_step2(
+        x, num_segments, segment_length_ratio_range, seed
+    )
+    
+    # Step 3: Apply simple perturbations to selected frequency segments
+    perturbed_magnitude, perturbed_phase = _apply_frequency_perturbation(
+        magnitude_spectrum, phase_spectrum, freq_segments_mask,
+        magnitude_noise_scale, phase_noise_scale
+    )
+    
+    # Step 4: Inverse FFT to reconstruct time-domain signal
+    augmented_signal = _ifft_reconstruct(perturbed_magnitude, perturbed_phase, L)
+    
+    return augmented_signal
     
 class Dataset_ETT_hour(Dataset):
     def __init__(self, root_path, flag='train', size=None,
@@ -582,7 +937,12 @@ class Dataset_EEG_Seizure(Dataset):
                  aug_ww=False, aug_ww_p_low=0.3, aug_ww_p_high=0.7,
                  aug_ww_win_ratio_low=0.1, aug_ww_win_ratio_high=0.3,
                  aug_ww_speed_low=0.8, aug_ww_speed_high=1.2,
-                 aug_ww_margin=0.5, aug_ww_only_bg=False):
+                 aug_ww_margin=0.5, aug_ww_only_bg=False,
+                 # ---- Frequency Domain augmentation hyperparameters ----
+                 aug_freq=False, aug_freq_p=0.5, aug_freq_num_segments=3,
+                 aug_freq_segment_ratio_low=0.05, aug_freq_segment_ratio_high=0.15,
+                 aug_freq_magnitude_preserve=True, aug_freq_phase_noise_std=0.1,
+                 aug_freq_only_bg=False):
         """
         EEG Seizure Detection Dataset
         
@@ -622,6 +982,16 @@ class Dataset_EEG_Seizure(Dataset):
             aug_ww_speed_high: Upper bound for time warping speed ratio
             aug_ww_margin: Margin from boundaries in seconds
             aug_ww_only_bg: Whether to apply WW augmentation only to background (non-seizure) samples
+            
+            # Frequency Domain augmentation parameters
+            aug_freq: Whether to enable Frequency Domain augmentation
+            aug_freq_p: Probability of applying frequency domain augmentation
+            aug_freq_num_segments: Number of continuous frequency segments to perturb
+            aug_freq_segment_ratio_low: Lower bound for segment length ratio
+            aug_freq_segment_ratio_high: Upper bound for segment length ratio
+            aug_freq_magnitude_preserve: Whether to preserve energy by matching original magnitude statistics
+            aug_freq_phase_noise_std: Standard deviation for phase noise (in radians)
+            aug_freq_only_bg: Whether to apply frequency augmentation only to background (non-seizure) samples
         """
         # Set sequence length
         if size is None:
@@ -667,6 +1037,16 @@ class Dataset_EEG_Seizure(Dataset):
         self.aug_ww_speed_high = aug_ww_speed_high
         self.aug_ww_margin = aug_ww_margin
         self.aug_ww_only_bg = aug_ww_only_bg
+        
+        # Initialize Frequency Domain augmentation parameters
+        self.aug_freq = aug_freq
+        self.aug_freq_p = aug_freq_p
+        self.aug_freq_num_segments = aug_freq_num_segments
+        self.aug_freq_segment_ratio_low = aug_freq_segment_ratio_low
+        self.aug_freq_segment_ratio_high = aug_freq_segment_ratio_high
+        self.aug_freq_magnitude_preserve = aug_freq_magnitude_preserve
+        self.aug_freq_phase_noise_std = aug_freq_phase_noise_std
+        self.aug_freq_only_bg = aug_freq_only_bg
         
         self.root_path = root_path
         self.data_path = data_path
@@ -814,10 +1194,21 @@ class Dataset_EEG_Seizure(Dataset):
             if triggered:
                 # Step 3: Time mapping (length-preserving warping)
                 x = _window_warping_step3(x, sub_win_start, sub_win_end, speed_ratio)
-                
-                # Debug output commented out to avoid excessive training logs
-                # print(f"WW applied: sub_window [{sub_win_start}:{sub_win_end}], speed_ratio={speed_ratio:.2f}")
-                # TODO: Step 4 may require additional processing (e.g., seizure boundary checks)
+
+        # --- Apply Frequency Domain augmentation only to training data ---
+        if (self.original_flag == 'train'                          # Only apply during training
+            and self.aug_freq
+            and torch.rand(1).item() < self.aug_freq_p
+            and (not self.aug_freq_only_bg or (self.aug_freq_only_bg and y.item() == 0.0))):
+            
+            x = _frequency_domain_augment(
+                x,
+                num_segments=self.aug_freq_num_segments,
+                segment_length_ratio_range=(self.aug_freq_segment_ratio_low, self.aug_freq_segment_ratio_high),
+                magnitude_preserve_energy=self.aug_freq_magnitude_preserve,
+                phase_noise_std=self.aug_freq_phase_noise_std,
+                seed=None  # Use random seed for variability
+            )
 
         # Create dummy time marks (not used in classification)
         seq_x_mark = np.zeros((self.seq_len, 4))  # Dummy time features
